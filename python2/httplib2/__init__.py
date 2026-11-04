@@ -19,7 +19,7 @@ __contributors__ = [
     "Alex Yu",
 ]
 __license__ = "MIT"
-__version__ = "0.19.0"
+__version__ = "0.19.0+fs1"
 
 import base64
 import calendar
@@ -459,19 +459,92 @@ def _entry_disposition(response_headers, request_headers):
     return retval
 
 
+# CVE-2026-59939: bound gzip/deflate decoding. Python 2 port of httplib2 0.32.0 ``decode.LimitDecoder``
+# (same defaults and environment variable names); the upstream fix needs Python >= 3.8.
+def _env_number(name, cast, default):
+    value = os.environ.get(name)
+    return cast(value) if value else default
+
+
+DECODE_LIMIT_RATIO = _env_number("httplib2_decode_limit_ratio", float, 100.0)
+DECODE_LIMIT_SAFE = _env_number("httplib2_decode_limit_safe", int, 10 << 20)
+DECODE_LIMIT_HARD = _env_number("httplib2_decode_limit_hard", int, 10 << 30)
+DECODE_CHUNK_SIZE = _env_number("httplib2_decode_limit_chunk", int, 64 << 10)
+
+
+class DecodeLimitExceeded(ValueError):
+    pass
+
+
+def _check_decode_limits(output_length, consumed_length):
+    # Hard cap always; the expansion ratio only applies once output passes the safe limit.
+    if DECODE_LIMIT_HARD > 0 and output_length > DECODE_LIMIT_HARD:
+        raise DecodeLimitExceeded("Decoded length %d exceeds hard limit %d" % (output_length, DECODE_LIMIT_HARD))
+    if DECODE_LIMIT_SAFE > 0 and output_length < DECODE_LIMIT_SAFE:
+        return
+    if DECODE_LIMIT_RATIO > 0 and output_length > max(consumed_length, 1) * DECODE_LIMIT_RATIO:
+        raise DecodeLimitExceeded(
+            "Amplification %d/%d exceeds ratio %s" % (output_length, consumed_length, DECODE_LIMIT_RATIO)
+        )
+
+
+def _gunzip_limited(data):
+    # GzipFile.read(n) inflates a few KB of input per step, so chunked reads keep memory bounded
+    # while keeping the same gzip handling (multi-member streams, CRC checks, errors).
+    source = StringIO.StringIO(data)
+    stream = gzip.GzipFile(fileobj=source)
+    parts = []
+    output_length = 0
+    while True:
+        piece = stream.read(DECODE_CHUNK_SIZE)
+        if not piece:
+            break
+        output_length += len(piece)
+        _check_decode_limits(output_length, source.tell())
+        parts.append(piece)
+    return "".join(parts)
+
+
+def _check_raw_deflate_size(data):
+    decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+    output_length = 0
+    consumed_length = 0
+    for start in range(0, len(data), DECODE_CHUNK_SIZE):
+        pending = data[start : start + DECODE_CHUNK_SIZE]
+        consumed_length += len(pending)
+        while pending:
+            output_length += len(decoder.decompress(pending, DECODE_CHUNK_SIZE))
+            _check_decode_limits(output_length, consumed_length)
+            pending = decoder.unconsumed_tail
+    while True:
+        piece = decoder.decompress("", DECODE_CHUNK_SIZE)
+        if not piece:
+            break
+        output_length += len(piece)
+        _check_decode_limits(output_length, consumed_length)
+
+
 def _decompressContent(response, new_content):
     content = new_content
     try:
         encoding = response.get("content-encoding", None)
         if encoding in ["gzip", "deflate"]:
             if encoding == "gzip":
-                content = gzip.GzipFile(fileobj=StringIO.StringIO(new_content)).read()
+                content = _gunzip_limited(new_content)
             if encoding == "deflate":
+                # Size check first, then the original call so results and errors stay identical.
+                _check_raw_deflate_size(content)
                 content = zlib.decompress(content, -zlib.MAX_WBITS)
             response["content-length"] = str(len(content))
             # Record the historical presence of the encoding in a way the won't interfere.
             response["-content-encoding"] = response["content-encoding"]
             del response["content-encoding"]
+    except DecodeLimitExceeded as e:
+        raise FailedToDecompressContent(
+            _("Content compressed with %s exceeds decode limits: %s") % (response.get("content-encoding"), e),
+            response,
+            "",
+        )
     except (IOError, zlib.error):
         content = ""
         raise FailedToDecompressContent(
